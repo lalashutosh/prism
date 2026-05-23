@@ -45,6 +45,7 @@ from core.types import (
     ValidationSection,
     WeakClaim,
 )
+from core.logger import log_reasoning
 from core.memory import ValidationAgentMemoryView
 from prompts.validation_prompts import (
     CLAIM_VALIDATION_TEMPLATE,
@@ -333,11 +334,17 @@ def run_validation_agent(
     analysis_sections = _get_analysis_sections(memory)
     all_weak          = identify_weak_claims(analysis_sections)
 
+    # setdefault() is used here rather than direct assignment so that calling
+    # run_validation_agent again after a RetrievalSignal re-uses the same
+    # mutable objects that were populated in the previous invocation.
+    # The orchestrator never resets these between signal cycles — it is the
+    # agent's responsibility to skip already-processed claims via processed_ids.
     processed_ids: set[str]   = context.setdefault("processed_claim_ids", set())
     retry_counts:  dict[str, int] = context.setdefault("retry_counts", {})
     max_reached:   set[str]   = context.setdefault("max_retrievals_reached", set())
 
-    # Accumulate results across invocations via context (survives signal cycles).
+    # Results are accumulated across invocations via context (survives signal cycles).
+    # Writing only happens after the for-loop finishes all weak claims.
     overturned_claims: list[OverturnedClaim]  = context.setdefault("overturned_claims", [])
     flags:             list[ValidationFlag]   = context.setdefault("flags", [])
     unresolved_ids:    list[str]              = context.setdefault("unresolved_ids", [])
@@ -374,7 +381,11 @@ def run_validation_agent(
 
         # Assess this claim with whatever chunks we have.
         prompt = build_claim_validation_prompt(wc, facts, relevant)
-        response_text = _call_llm(prompt, VALIDATION_SYSTEM_PROMPT, llm_client)
+        # Wrap per-claim so each LLM call is logged with the claim's dimension.
+        # dimension=wc.dimension_id (not claim_id) so the reasoning trace is
+        # queryable by the same dimension keys used by the analysis entries.
+        _logged_llm = log_reasoning(agent="validation", dimension=wc.dimension_id)(_call_llm)
+        response_text = _logged_llm(prompt, VALIDATION_SYSTEM_PROMPT, llm_client)
         status, finding, new_chunk_ids, new_conf, new_label = (
             parse_claim_validation_response(response_text, wc)
         )
@@ -403,6 +414,10 @@ def run_validation_agent(
     has_unresolved = bool(unresolved_ids)
     has_overturned = bool(overturned_claims)
 
+    # Overall validation confidence reflects the worst outcome encountered:
+    #   LOW    — any claim could not be resolved (still uncertain after retry)
+    #   MEDIUM — at least one claim was overturned (evidence quality improved)
+    #   HIGH   — every weak claim was confirmed (original analysis was sound)
     if has_unresolved:
         overall = Confidence.LOW
     elif has_overturned:

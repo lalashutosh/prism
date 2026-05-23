@@ -50,6 +50,7 @@ from core.types import (
     TransparencySection,
     FactSection,
 )
+from core.logger import log_reasoning
 from core.memory import AnalysisAgentMemoryView
 from prompts.analysis_prompts import (
     ANALYSIS_SYSTEM_PROMPT,
@@ -281,6 +282,7 @@ def score_overall_confidence(claims: list[Claim]) -> Confidence:
     for claim in claims:
         counts[claim.confidence] = counts.get(claim.confidence, 0) + 1
 
+    # Rule 1 (highest priority): any INSUFFICIENT claim poisons the whole section.
     if counts[Confidence.INSUFFICIENT] > 0:
         return Confidence.INSUFFICIENT
 
@@ -288,10 +290,13 @@ def score_overall_confidence(claims: list[Claim]) -> Confidence:
     high_ratio = counts[Confidence.HIGH] / total
     high_med_ratio = (counts[Confidence.HIGH] + counts[Confidence.MEDIUM]) / total
 
+    # Rule 2: ≥80% HIGH → the section is highly reliable.
     if high_ratio >= 0.8:
         return Confidence.HIGH
+    # Rule 3: ≥50% HIGH or MEDIUM → the section is moderately reliable.
     if high_med_ratio >= 0.5:
         return Confidence.MEDIUM
+    # Rule 4: less than half the claims have useful confidence → LOW.
     return Confidence.LOW
 
 
@@ -306,7 +311,7 @@ def _extract_json(text: str) -> dict:
       3. Regex for the first { ... } span (greedy).
     Returns an empty dict on total failure.
     """
-    # Strategy 1 – direct parse
+    # Strategy 1 – direct parse: LLM followed the "JSON only" instruction.
     try:
         result = json.loads(text)
         if isinstance(result, dict):
@@ -314,7 +319,7 @@ def _extract_json(text: str) -> dict:
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # Strategy 2 – markdown code block
+    # Strategy 2 – markdown code block: LLM wrapped JSON in a ```json fence.
     block_match = re.search(r"```(?:json)?\s*\n(.*?)\n```", text, re.DOTALL)
     if block_match:
         try:
@@ -324,7 +329,7 @@ def _extract_json(text: str) -> dict:
         except (json.JSONDecodeError, ValueError):
             pass
 
-    # Strategy 3 – greedy brace match
+    # Strategy 3 – greedy brace match: JSON is embedded inside surrounding prose.
     brace_match = re.search(r"\{.*\}", text, re.DOTALL)
     if brace_match:
         try:
@@ -334,6 +339,7 @@ def _extract_json(text: str) -> dict:
         except (json.JSONDecodeError, ValueError):
             pass
 
+    # All three strategies failed — return empty dict so callers fall back to INSUFFICIENT.
     return {}
 
 
@@ -570,6 +576,10 @@ def run_analysis_agent(
         sufficient, reason = check_evidence_sufficiency(relevant_chunks, dimension_id)
 
         if not sufficient and dimension_id not in max_reached:
+            # Returning here exits run_analysis_agent immediately.  The orchestrator
+            # will fetch more chunks, then call run_analysis_agent again from the top.
+            # The resume check at the start of the loop ensures already-written
+            # dimensions are skipped so work is never duplicated.
             query, filters = formulate_retrieval_query(dimension_id, facts, chunks)
             return RetrievalSignal(
                 query=query,
@@ -581,7 +591,12 @@ def run_analysis_agent(
         prompt = build_dimension_prompt(
             facts, relevant_chunks, dimension_id, refined_context
         )
-        response_text = _call_llm(prompt, ANALYSIS_SYSTEM_PROMPT, llm_client)
+        # Wrap _call_llm with the reasoning decorator per-dimension so each LLM
+        # call is logged with the correct dimension tag.  A new wrapper is created
+        # on each iteration; the decorator is a lightweight closure and the cost
+        # is negligible.  When no PrismLogger is active the wrapper is a no-op.
+        _logged_llm = log_reasoning(agent="analysis", dimension=dimension_id)(_call_llm)
+        response_text = _logged_llm(prompt, ANALYSIS_SYSTEM_PROMPT, llm_client)
         finding = parse_dimension_response(response_text, dimension_id)
 
         # Write immediately; do not batch.

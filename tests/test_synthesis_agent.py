@@ -51,6 +51,9 @@ from agents.synthesis_agent import (
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
+# The hiring-algorithm scenario was chosen because it spans multiple risk
+# dimensions (high-risk under employment/Annex III, potential GPAI, both
+# provider and deployer roles) making it a realistic synthesis target.
 
 def _make_facts() -> FactSection:
     return FactSection(
@@ -102,7 +105,13 @@ def _make_risk_section(confidence: Confidence = Confidence.HIGH) -> RiskSection:
 
 
 def _populate_all_analysis_sections(memory: SessionMemory) -> None:
-    """Write all six analysis sections into memory directly (bypass proxy)."""
+    """Write all six analysis sections into memory directly (bypass proxy).
+
+    Bypassing the proxy is intentional here — we want to set up a realistic
+    pre-synthesis state without running the actual analysis agent.  Tests then
+    selectively modify individual sections (e.g. setting confidence to INSUFFICIENT)
+    to isolate the synthesis agent behaviour under test.
+    """
     memory.definition_check = _make_definition_section()
     memory.risk_classification = _make_risk_section()
     memory.prohibited_practices = ProhibitedSection(
@@ -166,7 +175,12 @@ def _make_valid_synthesis_response(
     def_confidence: str = "HIGH",
     risk_confidence: str = "HIGH",
 ) -> dict:
-    """Build a plausible synthesis response dict."""
+    """Build a plausible synthesis response dict.
+
+    The two overrideable confidence parameters (def_confidence, risk_confidence)
+    are the ones that determine_loop_condition checks.  Setting both to
+    "INSUFFICIENT" triggers a LoopSignal; any other combination does not.
+    """
     return {
         "report": {
             "use_case_summary": "The hiring algorithm screens applicants.",
@@ -459,6 +473,10 @@ class TestParseSynthesisResponse:
 
 # ── run_synthesis_agent (orchestration) ───────────────────────────────────
 
+# ── run_synthesis_agent (orchestration) ───────────────────────────────────
+# The critical invariant under test here is: loop condition is checked on the
+# *parsed* confidence (before any write) so that memory stays clean for rollback.
+
 class TestRunSynthesisAgent:
     def test_emits_loop_signal_when_critical_sections_insufficient(self):
         """When both critical dimensions are INSUFFICIENT, emit LoopSignal."""
@@ -481,7 +499,12 @@ class TestRunSynthesisAgent:
         assert isinstance(signal, LoopSignal)
 
     def test_does_not_write_to_memory_when_loop_signal_emitted(self):
-        """Memory must stay clean when LoopSignal is returned."""
+        """Memory must stay clean when LoopSignal is returned.
+
+        This is the most important invariant of the synthesis agent: if looping,
+        NO memory writes must occur so the orchestrator can roll back to the
+        after_analysis checkpoint without needing to undo partial synthesis writes.
+        """
         memory = SessionMemory()
         memory.facts = _make_facts()
         _populate_all_analysis_sections(memory)

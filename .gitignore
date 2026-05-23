@@ -1,0 +1,24 @@
+# ---------------------------------------------------
+# 1. Python Cache & Compilation Artifacts (Essential)
+# ---------------------------------------------------
+# This covers all the __pycache__ folders and .pyc files in your tree
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ---------------------------------------------------
+# 2. Pytest Artifacts (Essential)
+# ---------------------------------------------------
+# You have pytest cache files (e.g., .cpython-314-pytest-9.0.3.pyc)
+.pytest_cache/
+
+
+# ---------------------------------------------------
+# 3. Standard Environment / IDE folders (Standard)
+# ---------------------------------------------------
+.venv/
+venv/
+env/
+.env
+.vscode/
+.idea/

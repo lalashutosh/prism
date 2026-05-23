@@ -16,7 +16,11 @@ Nothing in this file triggers I/O, LLM calls, or retrieval.
 from __future__ import annotations
 
 import copy
+import dataclasses
+import enum
+import json
 from dataclasses import dataclass, field
+from functools import wraps
 from typing import Any, Optional
 
 from core.types import (
@@ -45,6 +49,8 @@ from core.types import (
 # ── Source-type sets used by label-consistency validation ────────────────────
 
 # Chunks from the built-in corpus — these may NOT be labeled FACT.
+# Labeling a corpus chunk FACT would falsely imply the claim originated
+# from the user's uploaded document rather than retrieved legislation.
 CORPUS_SOURCE_TYPES: frozenset[str] = frozenset({
     "legislation",
     "official_guidance",
@@ -53,9 +59,136 @@ CORPUS_SOURCE_TYPES: frozenset[str] = frozenset({
 })
 
 # Chunks from the user's uploaded document — these may NOT be labeled RETRIEVED.
+# Labeling an uploaded chunk RETRIEVED would falsely imply it came from
+# the legislation corpus rather than the user's own submission.
 UPLOADED_SOURCE_TYPES: frozenset[str] = frozenset({
     "uploaded_doc",
 })
+
+
+# ── State-change logging helpers ─────────────────────────────────────────────
+#
+# These helpers let proxy write methods emit a StateChangeEntry via the active
+# PrismLogger without importing logger.py at module level (deferred imports
+# prevent any circular dependency since logger.py never imports memory.py).
+
+def _section_to_dict(value: Any) -> Optional[dict]:
+    """Convert a section value to a JSON-serializable dict.
+
+    Handles:
+      - dataclasses   → dataclasses.asdict() + JSON round-trip to convert enums
+      - list          → wrapped as {"items": [...]} so the result is always a dict
+      - None          → returned as None (used for previous_state on first write)
+    The JSON round-trip converts enum members to their .value strings.
+    """
+    if value is None:
+        return None
+    try:
+        if isinstance(value, list):
+            # List fields (weak_claims, overturned_claims) are wrapped in a dict
+            # so StateChangeEntry.new_state is always a plain dict, never a list.
+            raw_items = [
+                dataclasses.asdict(item) if dataclasses.is_dataclass(item) else item
+                for item in value
+            ]
+            raw: Any = {"items": raw_items}
+        elif dataclasses.is_dataclass(value):
+            raw = dataclasses.asdict(value)
+        else:
+            raw = {"value": value}
+        return json.loads(
+            json.dumps(raw, default=lambda o: o.value if isinstance(o, enum.Enum) else str(o))
+        )
+    except (TypeError, ValueError):
+        return {"error": "could not serialise section"}
+
+
+def _log_state_change(
+    agent: str,
+    section: str,
+    new_state: Optional[dict],
+    previous_state: Optional[dict],
+    write_validated: bool,
+    validation_errors: Optional[list] = None,
+) -> None:
+    """Write a StateChangeEntry via the active PrismLogger, if one is active.
+
+    Uses deferred imports from core.logger to avoid circular imports:
+      core.logger → core.log_schema / core.log_store  (no import of memory.py)
+      core.memory → core.logger  (deferred; executed only on first call)
+
+    A no-op when no PrismLogger has been activated, so all agent unit tests
+    that call proxy write methods directly remain completely unaffected.
+    """
+    from core.logger import _LOGGER_VAR, SESSION_ID_VAR      # noqa: PLC0415
+    from core.log_schema import StateChangeEntry              # noqa: PLC0415
+
+    active_logger = _LOGGER_VAR.get()
+    session_id = SESSION_ID_VAR.get()
+
+    if active_logger is None or not session_id:
+        return  # no logger active — transparent no-op
+
+    entry = StateChangeEntry(
+        session_id=session_id,
+        section=section,
+        agent=agent,
+        new_state=new_state or {},
+        previous_state=previous_state,
+        write_validated=write_validated,
+        validation_errors=validation_errors or [],
+    )
+    active_logger.state_change(entry)
+
+
+def _log_write(section_name: str, agent_name: str):
+    """Decorator factory that adds StateChangeEntry logging to a proxy write method.
+
+    Captures *previous_state* from ``self._memory.<section_name>`` before the
+    write attempt, then logs the outcome after:
+      - On success (validation passed, memory updated): write_validated=True.
+      - On MemoryWriteError (validation failed): write_validated=False,
+        validation_errors filled, exception re-raised unchanged.
+
+    This keeps all logging logic in one place — the 13 write methods in the
+    four proxy classes each get a one-line decorator instead of try/except blocks.
+
+    Parameters
+    ----------
+    section_name : str
+        The SessionMemory attribute name for this section (e.g. "definition_check").
+    agent_name : str
+        The owning agent name: "extraction" | "analysis" | "validation" | "synthesis".
+    """
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(self, value, *args, **kwargs):
+            # Snapshot before the write so the log records what was there before.
+            previous = getattr(self._memory, section_name, None)
+            try:
+                result = fn(self, value, *args, **kwargs)
+                _log_state_change(
+                    agent=agent_name,
+                    section=section_name,
+                    new_state=_section_to_dict(value),
+                    previous_state=_section_to_dict(previous),
+                    write_validated=True,
+                )
+                return result
+            except MemoryWriteError as exc:
+                # Log the failure before re-raising so the orchestrator still
+                # receives the MemoryWriteError and can roll back.
+                _log_state_change(
+                    agent=agent_name,
+                    section=section_name,
+                    new_state=_section_to_dict(value),
+                    previous_state=_section_to_dict(previous),
+                    write_validated=False,
+                    validation_errors=[f"{exc.check_name}: {exc.detail}"],
+                )
+                raise
+        return wrapper
+    return decorator
 
 
 # ── SessionMemory ─────────────────────────────────────────────────────────────
@@ -70,12 +203,16 @@ class SessionMemory:
       validation_flags … overturned_claims → validation agent writes
       final_report … confidence_summary  → synthesis agent writes
       _orchestrator         → orchestrator only; never exposed via proxies
+
+    All fields start as None / empty so agents can detect whether a previous
+    agent has completed its section (None = not yet written).
     """
 
     # Owned by extraction agent
     facts:                Optional[FactSection]       = None
 
-    # Owned by analysis agent
+    # Owned by analysis agent — one field per legal dimension.
+    # Written sequentially; None means the dimension has not been assessed yet.
     risk_classification:  Optional[RiskSection]       = None
     definition_check:     Optional[DefinitionSection] = None
     prohibited_practices: Optional[ProhibitedSection] = None
@@ -93,15 +230,23 @@ class SessionMemory:
     follow_up_questions:  Optional[FollowUpSection]    = None
     confidence_summary:   Optional[ConfidenceSection]  = None
 
-    # Private: orchestrator only — never surfaced through any proxy
+    # Private: orchestrator only — never surfaced through any proxy.
+    # Holds the retrieval cache, named checkpoints, retry counters, and
+    # the set of all chunk IDs that have been retrieved this session.
     _orchestrator:        OrchestratorState            = field(
                               default_factory=OrchestratorState
                           )
 
 
 # ── Shared validation helpers ─────────────────────────────────────────────────
+#
+# These are pure functions called by every proxy write method.
+# They raise MemoryWriteError on the first failure found, giving the
+# orchestrator a precise check_name to log and act on.
 
 def _check_schema(value: Any, expected_type: type, field_name: str) -> None:
+    # Guard against passing the wrong dataclass type to a write method
+    # (e.g. a RiskSection where a DefinitionSection is expected).
     if not isinstance(value, expected_type):
         raise MemoryWriteError(
             "schema",
@@ -111,6 +256,8 @@ def _check_schema(value: Any, expected_type: type, field_name: str) -> None:
 
 
 def _check_confidence(conf: Any, field_name: str) -> None:
+    # Ensures every confidence value is a proper Confidence enum member,
+    # not a raw string like "HIGH" that would bypass enum semantics.
     if not isinstance(conf, Confidence):
         raise MemoryWriteError(
             "confidence_bounds",
@@ -119,6 +266,9 @@ def _check_confidence(conf: Any, field_name: str) -> None:
 
 
 def _check_label(label: Any, field_name: str) -> None:
+    # Grouped under "confidence_bounds" because both label and confidence
+    # are epistemological quality markers on a claim; keeping them under one
+    # check_name simplifies orchestrator error-handling branches.
     if not isinstance(label, Label):
         raise MemoryWriteError(
             "confidence_bounds",        # grouped under same category for simplicity
@@ -131,6 +281,9 @@ def _check_citations(
     retrieved_chunk_ids: set[str],
     field_name: str,
 ) -> None:
+    # Any chunk_id cited in a claim must have been retrieved this session.
+    # This prevents agents from fabricating citations to chunks that were
+    # never fetched from the retrieval layer.
     missing = [cid for cid in chunk_ids if cid not in retrieved_chunk_ids]
     if missing:
         raise MemoryWriteError(
@@ -149,7 +302,11 @@ def _check_label_consistency(
     for cid in chunk_ids:
         chunk = chunk_lookup.get(cid)
         if chunk is None:
-            continue  # citation-integrity check already handles truly missing IDs
+            # The chunk_id is unknown in the current lookup snapshot.
+            # _check_citations already validates existence in retrieved_chunk_ids;
+            # if we reach here with a None lookup it means the lookup is stale,
+            # which is a runtime concern — skip rather than double-raising.
+            continue
         if chunk.source_type in CORPUS_SOURCE_TYPES and label == Label.FACT:
             raise MemoryWriteError(
                 "label_consistency",
@@ -170,6 +327,9 @@ def _validate_claims(
     chunk_lookup: dict[str, Chunk],
     parent_name: str,
 ) -> None:
+    # Run all four checks on every claim in a section.
+    # The location string (e.g. "definition_check.claims[2]") is threaded
+    # through so any error message pinpoints exactly which claim failed.
     for i, claim in enumerate(claims):
         loc = f"{parent_name}.claims[{i}]"
         _check_label(claim.label, f"{loc}.label")
@@ -184,6 +344,10 @@ def _validate_dimension_finding(
     chunk_lookup: dict[str, Chunk],
     field_name: str,
 ) -> None:
+    # Two-level validation: first check the section-level confidence,
+    # then delegate to _validate_claims for per-claim checks.
+    # Order matters: section confidence is checked before iterating claims
+    # so that a missing enum value is caught immediately.
     _check_confidence(finding.confidence, f"{field_name}.confidence")
     _validate_claims(finding.claims, retrieved_chunk_ids, chunk_lookup, field_name)
 
@@ -194,10 +358,12 @@ def _validate_dimension_finding(
 # The orchestrator supplies:
 #   - a reference to the live SessionMemory object
 #   - a reference to the live retrieved_chunk_ids set (mutated as the
-#     orchestrator adds new chunks)
-#   - a snapshot of chunk_lookup at construction time (rebuilt each re-invoke)
+#     orchestrator adds new chunks — the proxy always sees the current set)
+#   - a fresh chunk_lookup dict built from all cached retrieval results
+#     (rebuilt on every re-invocation so label checks use up-to-date metadata)
 #
 # Agents only interact with memory through these proxy objects.
+# The orchestrator never passes the raw SessionMemory to an agent.
 
 class ExtractionAgentMemoryView:
     """
@@ -211,10 +377,16 @@ class ExtractionAgentMemoryView:
         retrieved_chunk_ids: set[str],
         chunk_lookup: dict[str, Chunk],
     ) -> None:
+        # Use object.__setattr__ to bypass any potential __setattr__ override
+        # and store the references directly on the instance dict.
+        # This is the standard pattern for storing private state on proxy objects
+        # that define __getattr__ — without it, self._memory = memory would
+        # itself trigger __getattr__ before the attribute exists.
         object.__setattr__(self, "_memory", memory)
         object.__setattr__(self, "_retrieved_chunk_ids", retrieved_chunk_ids)
         object.__setattr__(self, "_chunk_lookup", chunk_lookup)
 
+    @_log_write("facts", "extraction")
     def write_facts(self, facts: FactSection) -> None:
         """Write the extraction output.
 
@@ -223,15 +395,25 @@ class ExtractionAgentMemoryView:
         into retrieved_chunk_ids before calling this method.
         """
         _check_schema(facts, FactSection, "facts")
+        # source_chunk_ids can legitimately be empty if the extraction agent
+        # did not assign chunk IDs to document passages. Skip the citation
+        # check in that case to avoid a false positive on an empty list.
         if facts.source_chunk_ids:
             _check_citations(
                 facts.source_chunk_ids,
                 self._retrieved_chunk_ids,
                 "facts.source_chunk_ids",
             )
+        # deepcopy prevents the caller from mutating memory by holding
+        # a reference to the same FactSection object after writing.
         self._memory.facts = copy.deepcopy(facts)
 
     def __getattr__(self, name: str) -> Any:
+        # __getattr__ is only called when normal attribute lookup fails.
+        # Because _memory, _retrieved_chunk_ids, and _chunk_lookup are set
+        # via object.__setattr__ they ARE found by normal lookup and never
+        # reach here. Any other name — including all of SessionMemory's public
+        # fields — falls through to this sentinel and raises AttributeError.
         raise AttributeError(
             f"ExtractionAgentMemoryView does not expose attribute '{name}'"
         )
@@ -252,11 +434,15 @@ class AnalysisAgentMemoryView:
         retrieved_chunk_ids: set[str],
         chunk_lookup: dict[str, Chunk],
     ) -> None:
+        # Same object.__setattr__ pattern as ExtractionAgentMemoryView —
+        # necessary whenever __getattr__ is defined on the class.
         object.__setattr__(self, "_memory", memory)
         object.__setattr__(self, "_retrieved_chunk_ids", retrieved_chunk_ids)
         object.__setattr__(self, "_chunk_lookup", chunk_lookup)
 
     # ── Readable (deepcopy) ──────────────────────────────────────────────────
+    # All readable properties return a deepcopy so the agent cannot mutate
+    # shared state by modifying the object it received.
 
     @property
     def facts(self) -> Optional[FactSection]:
@@ -264,9 +450,13 @@ class AnalysisAgentMemoryView:
 
     @property
     def validation_flags(self) -> Optional[ValidationSection]:
+        # Exposed so the analysis agent can read any flags written by a previous
+        # loop iteration — used as loop-context on retry after a LoopSignal.
         return copy.deepcopy(self._memory.validation_flags)
 
-    # Own sections readable so the agent can detect which are already done.
+    # Own sections are readable so the agent can detect which dimensions it has
+    # already written and skip them on re-invocation after a RetrievalSignal.
+    # None means "not yet written"; a non-None value means "already done".
     @property
     def definition_check(self) -> Optional[DefinitionSection]:
         return copy.deepcopy(self._memory.definition_check)
@@ -292,7 +482,12 @@ class AnalysisAgentMemoryView:
         return copy.deepcopy(self._memory.governance)
 
     # ── Writable (validated) ─────────────────────────────────────────────────
+    # Every write method follows the same three-step pattern:
+    #   1. _check_schema     — correct dataclass type?
+    #   2. _validate_*       — all claims valid? citations exist? labels consistent?
+    #   3. deepcopy-and-commit — write an independent copy into SessionMemory
 
+    @_log_write("definition_check", "analysis")
     def write_definition(self, section: DefinitionSection) -> None:
         _check_schema(section, DefinitionSection, "definition_check")
         _validate_dimension_finding(
@@ -300,6 +495,7 @@ class AnalysisAgentMemoryView:
         )
         self._memory.definition_check = copy.deepcopy(section)
 
+    @_log_write("risk_classification", "analysis")
     def write_risk(self, section: RiskSection) -> None:
         _check_schema(section, RiskSection, "risk_classification")
         _validate_dimension_finding(
@@ -307,6 +503,7 @@ class AnalysisAgentMemoryView:
         )
         self._memory.risk_classification = copy.deepcopy(section)
 
+    @_log_write("prohibited_practices", "analysis")
     def write_prohibited(self, section: ProhibitedSection) -> None:
         _check_schema(section, ProhibitedSection, "prohibited_practices")
         _validate_dimension_finding(
@@ -314,6 +511,7 @@ class AnalysisAgentMemoryView:
         )
         self._memory.prohibited_practices = copy.deepcopy(section)
 
+    @_log_write("transparency", "analysis")
     def write_transparency(self, section: TransparencySection) -> None:
         _check_schema(section, TransparencySection, "transparency")
         _validate_dimension_finding(
@@ -321,6 +519,7 @@ class AnalysisAgentMemoryView:
         )
         self._memory.transparency = copy.deepcopy(section)
 
+    @_log_write("roles", "analysis")
     def write_roles(self, section: RolesSection) -> None:
         _check_schema(section, RolesSection, "roles")
         _validate_dimension_finding(
@@ -328,6 +527,7 @@ class AnalysisAgentMemoryView:
         )
         self._memory.roles = copy.deepcopy(section)
 
+    @_log_write("governance", "analysis")
     def write_governance(self, section: GovernanceSection) -> None:
         _check_schema(section, GovernanceSection, "governance")
         _validate_dimension_finding(
@@ -336,6 +536,10 @@ class AnalysisAgentMemoryView:
         self._memory.governance = copy.deepcopy(section)
 
     def __getattr__(self, name: str) -> Any:
+        # Catches any attribute access that isn't one of the explicitly defined
+        # properties or methods above — including final_report, follow_up_questions,
+        # and _orchestrator — and turns it into an AttributeError rather than
+        # silently returning None or falling back to the underlying memory object.
         raise AttributeError(
             f"AnalysisAgentMemoryView does not expose attribute '{name}'"
         )
@@ -359,6 +563,10 @@ class ValidationAgentMemoryView:
         object.__setattr__(self, "_chunk_lookup", chunk_lookup)
 
     # ── Readable ─────────────────────────────────────────────────────────────
+    # The validation agent needs to read all six analysis sections to identify
+    # which claims are weak and should be independently re-assessed.
+    # All reads are deepcopy so the validation agent cannot accidentally
+    # modify what the analysis agent wrote.
 
     @property
     def facts(self) -> Optional[FactSection]:
@@ -390,12 +598,20 @@ class ValidationAgentMemoryView:
 
     # ── Writable ─────────────────────────────────────────────────────────────
 
+    @_log_write("validation_flags", "validation")
     def write_validation_flags(self, section: ValidationSection) -> None:
+        # ValidationSection has an overall_confidence field that must also
+        # be checked; _validate_dimension_finding is not used here because
+        # ValidationSection does not subclass DimensionFinding.
         _check_schema(section, ValidationSection, "validation_flags")
         _check_confidence(section.overall_confidence, "validation_flags.overall_confidence")
         self._memory.validation_flags = copy.deepcopy(section)
 
+    @_log_write("weak_claims", "validation")
     def write_weak_claims(self, claims: list[WeakClaim]) -> None:
+        # Validate the list itself before iterating, then validate each element.
+        # WeakClaim does not carry chunk_ids (it references the original claim's
+        # citations), so only schema, confidence, and label checks apply here.
         if not isinstance(claims, list):
             raise MemoryWriteError("schema", "weak_claims must be a list")
         for i, wc in enumerate(claims):
@@ -404,7 +620,11 @@ class ValidationAgentMemoryView:
             _check_label(wc.original_label, f"weak_claims[{i}].original_label")
         self._memory.weak_claims = copy.deepcopy(claims)
 
+    @_log_write("overturned_claims", "validation")
     def write_overturned_claims(self, claims: list[OverturnedClaim]) -> None:
+        # OverturnedClaim carries new_chunk_ids (the evidence used to overturn),
+        # so citation integrity and label consistency checks are applied on top
+        # of the standard schema / confidence / label checks.
         if not isinstance(claims, list):
             raise MemoryWriteError("schema", "overturned_claims must be a list")
         for i, oc in enumerate(claims):
@@ -449,6 +669,9 @@ class SynthesisAgentMemoryView:
         object.__setattr__(self, "_chunk_lookup", chunk_lookup)
 
     # ── Readable ─────────────────────────────────────────────────────────────
+    # The synthesis agent has the broadest read access: it needs everything
+    # produced by both the analysis and validation agents in order to merge
+    # findings, apply overturned verdicts, and mark unresolved claims.
 
     @property
     def facts(self) -> Optional[FactSection]:
@@ -492,16 +715,25 @@ class SynthesisAgentMemoryView:
 
     # ── Writable ─────────────────────────────────────────────────────────────
 
+    @_log_write("final_report", "synthesis")
     def write_final_report(self, report: ReportSection) -> None:
+        # ReportSection contains only plain dicts and strings, so no
+        # citation or label checks are applied — schema alone is sufficient.
         _check_schema(report, ReportSection, "final_report")
         self._memory.final_report = copy.deepcopy(report)
 
+    @_log_write("follow_up_questions", "synthesis")
     def write_follow_up_questions(self, section: FollowUpSection) -> None:
         _check_schema(section, FollowUpSection, "follow_up_questions")
         self._memory.follow_up_questions = copy.deepcopy(section)
 
+    @_log_write("confidence_summary", "synthesis")
     def write_confidence_summary(self, section: ConfidenceSection) -> None:
         _check_schema(section, ConfidenceSection, "confidence_summary")
+        # Iterate over every named confidence field in the section and validate
+        # each one individually. getattr(section, fname) is used instead of
+        # listing the values manually so that adding a new field to ConfidenceSection
+        # only requires updating this tuple — not any surrounding logic.
         for fname in (
             "definition_check", "risk_classification", "prohibited_practices",
             "transparency", "roles", "governance", "overall",

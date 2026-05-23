@@ -44,6 +44,9 @@ from agents.validation_agent import (
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
+# Defaults are chosen so a claim with label=RETRIEVED, confidence=HIGH, and
+# chunk_ids=["leg_001"] passes all four validation checks.  Individual tests
+# override specific fields to trigger the condition under test.
 
 def _leg_chunk(chunk_id: str = "leg_001", text: str = "EU AI Act Article 3") -> Chunk:
     return Chunk(
@@ -107,6 +110,12 @@ def _setup_validation_view(
     memory: SessionMemory = None,
     chunks: list[Chunk] = None,
 ) -> tuple[ValidationAgentMemoryView, list[Chunk]]:
+    """Build a ValidationAgentMemoryView with all chunk metadata pre-registered.
+
+    Registering chunks in both retrieved_chunk_ids and chunk_lookup ensures
+    that the proxy's citation and label-consistency checks will pass for any
+    chunk returned by this helper.
+    """
     if memory is None:
         memory = SessionMemory()
     memory.facts = _make_facts()
@@ -426,6 +435,10 @@ class TestBuildOverturnedClaim:
 
 # ── run_validation_agent (orchestration) ─────────────────────────────────
 
+# ── run_validation_agent (orchestration) ─────────────────────────────────
+# These tests cover the full signal loop, the context-dict accumulation pattern,
+# and the write behaviour at the end of a successful validation pass.
+
 class TestRunValidationAgent:
     """Orchestration tests with a mock LLM client."""
 
@@ -521,7 +534,13 @@ class TestRunValidationAgent:
         assert memory.overturned_claims[0].status == ClaimStatus.OVERTURNED
 
     def test_processes_each_weak_claim_once(self):
-        """Agent should not call LLM multiple times for the same claim."""
+        """Agent should not call LLM multiple times for the same claim.
+
+        Uses a closure-based side_effect so each call returns a different
+        canned response, and the call_count asserts exactly one call per claim.
+        The same closure pattern is used in test_analysis_agent.py for the
+        multi-dimension sequential response test.
+        """
         memory = SessionMemory()
         memory.facts = _make_facts()
         # Two weak claims
