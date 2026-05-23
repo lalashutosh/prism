@@ -6,6 +6,9 @@ Raw prompt templates for the validation agent.
 Pure string constants — no logic, no imports.
 """
 
+# The system prompt frames the model as an *independent* reviewer to reduce
+# anchoring bias: the model should not simply restate the original claim
+# but must genuinely re-evaluate it against newly retrieved evidence.
 VALIDATION_SYSTEM_PROMPT = """\
 You are an independent EU AI Act legal reviewer.  Your task is to
 re-examine a specific claim from an earlier analysis pass and determine
@@ -51,8 +54,10 @@ Respond with ONLY this JSON structure:
 }}
 """
 
-# Keywords used to filter chunks relevant to a specific claim during validation.
-# Maps weakness-reason categories to additional search terms.
+# WEAKNESS_RETRIEVAL_TERMS maps each weakness reason code to additional search
+# terms that help the retrieval layer surface chunks more likely to resolve it.
+# These terms supplement the dimension-level DIMENSION_KEYWORDS from the
+# analysis prompts when building a validation-specific retrieval query.
 WEAKNESS_RETRIEVAL_TERMS: dict[str, list[str]] = {
     "LOW_CONFIDENCE": ["evidence", "clarification", "definition"],
     "ASSUMPTION":     ["statutory", "article", "regulation", "requirement"],

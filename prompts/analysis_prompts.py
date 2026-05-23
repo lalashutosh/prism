@@ -35,9 +35,16 @@ CRITICAL RULES
 #
 # Each value is inserted into the user-turn prompt by build_dimension_prompt().
 # Placeholders:
-#   {facts_text}      — serialised FactSection
+#   {facts_text}      — serialised FactSection (use case name, industry, capabilities, etc.)
 #   {chunks_text}     — numbered list of retrieved chunks with their chunk_ids
 #   {refined_context} — additional context from a synthesis loop-back (may be empty)
+#
+# Each template ends with a required JSON structure.  The JSON schemas use
+# double braces ({{, }}) to escape the curly-bracket characters so that Python's
+# str.format() does not interpret them as placeholder slots.
+#
+# The claim_id prefixes (def_, risk_, proh_, trans_, role_, gov_) are
+# dimension-specific to guarantee uniqueness across the session.
 
 DIMENSION_PROMPTS: dict[str, str] = {
 
@@ -303,6 +310,9 @@ Respond with ONLY this JSON structure:
 # ── Retrieval query templates ─────────────────────────────────────────────────
 #
 # Used by formulate_retrieval_query() to build targeted queries.
+# The {context} placeholder is filled with a truncated string of
+# (use_case_name, industry, deployment_context) to steer retrieval
+# toward legislation relevant to the specific use case, not generic text.
 
 DIMENSION_RETRIEVAL_TEMPLATES: dict[str, str] = {
     "definition_check":     "EU AI Act Article 3 definition AI system Annex I {context}",
@@ -314,6 +324,10 @@ DIMENSION_RETRIEVAL_TEMPLATES: dict[str, str] = {
 }
 
 # Keywords used for evidence sufficiency checks and chunk filtering.
+# check_evidence_sufficiency() requires at least one keyword match plus
+# one authoritative chunk to consider evidence sufficient for a dimension.
+# _filter_chunks_for_dimension() narrows the chunk list before building
+# the LLM prompt so each dimension receives only its relevant context.
 DIMENSION_KEYWORDS: dict[str, list[str]] = {
     "definition_check": [
         "ai system", "artificial intelligence", "machine learning", "model",

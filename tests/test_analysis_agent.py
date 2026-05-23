@@ -48,6 +48,9 @@ from agents.analysis_agent import (
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
+# Chunk helpers default to text containing multiple dimension keywords so that
+# a single chunk can satisfy check_evidence_sufficiency for multiple dimensions.
+# This keeps multi-dimension orchestration tests simple while remaining realistic.
 
 def _legislation_chunk(
     chunk_id: str = "leg_001",
@@ -91,7 +94,11 @@ def _make_facts(
 
 
 def _make_mock_llm(response_json: dict | str) -> Any:
-    """Return a mock client whose messages.create() returns a fixed string."""
+    """Return a mock client whose messages.create() returns a fixed string.
+
+    Mimics the interface: client.messages.create(...).content[0].text
+    The same mock shape is used across all three agent test files.
+    """
     if isinstance(response_json, dict):
         content = json.dumps(response_json)
     else:
@@ -456,11 +463,20 @@ class TestMakeInsufficientFinding:
 
 # ── run_analysis_agent (orchestration) ───────────────────────────────────
 
+# ── run_analysis_agent (orchestration) ───────────────────────────────────
+# These tests exercise the signal-loop behaviour and resume detection.
+# The mock LLM returns canned responses so we can control exactly how many
+# LLM calls are made and which sections get written.
+
 class TestRunAnalysisAgent:
     """Orchestration tests using a mock LLM client."""
 
     def _valid_llm_response(self, dimension_id: str, chunk_id: str = "leg_001") -> dict:
-        """Produce a valid dimension JSON response for the mock LLM."""
+        """Produce a valid dimension JSON response for the mock LLM.
+
+        The response includes the correct JSON keys for each dimension type so
+        parse_dimension_response returns the right DimensionFinding subclass.
+        """
         base = {
             "dimension_id": dimension_id,
             "claims": [{
@@ -488,7 +504,12 @@ class TestRunAnalysisAgent:
         return base
 
     def _make_multi_response_client(self, chunk_id: str = "leg_001") -> Any:
-        """Mock client that returns a valid response for each dimension call."""
+        """Mock client that returns a valid response for each dimension call.
+
+        Uses a closure counter so each successive LLM call gets the response
+        for the next dimension in DIMENSION_ORDER.  The call_count list (not
+        int) is used so the closure can mutate it without a nonlocal statement.
+        """
         responses = [
             self._valid_llm_response(dim, chunk_id) for dim in DIMENSION_ORDER
         ]
@@ -574,7 +595,13 @@ class TestRunAnalysisAgent:
         assert call_count[0] == 5   # skipped 1 dimension
 
     def test_proceeds_with_insufficient_when_max_retries_reached(self):
-        """When a dimension is in max_retrievals_reached, agent must not signal."""
+        """When a dimension is in max_retrievals_reached, agent must not signal.
+
+        max_retrievals_reached simulates the orchestrator having already hit the
+        MAX_RETRIEVAL_RETRIES limit for definition_check.  The agent should write
+        an INSUFFICIENT finding and continue to the next dimension rather than
+        emitting another RetrievalSignal that would loop forever.
+        """
         memory = SessionMemory()
         memory.facts = _make_facts()
         # Provide legislation chunks for all dims except definition_check

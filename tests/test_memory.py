@@ -44,6 +44,9 @@ from core.memory import (
 
 
 # ── Fixtures ─────────────────────────────────────────────────────────────────
+# These helpers build minimal valid objects for test setup.
+# Default values are chosen to pass all four validation checks so tests can
+# selectively break one check at a time by overriding a single argument.
 
 def _make_chunk(
     chunk_id: str = "leg_001",
@@ -89,7 +92,11 @@ def _make_definition_section(
 def _setup_memory_with_chunk(
     source_type: str = "legislation",
 ) -> tuple[SessionMemory, set[str], dict[str, Chunk]]:
-    """Return (memory, retrieved_chunk_ids, chunk_lookup) with one pre-registered chunk."""
+    """Return (memory, retrieved_chunk_ids, chunk_lookup) with one pre-registered chunk.
+
+    Pre-registering the chunk simulates the orchestrator having called retrieve()
+    before the agent writes — all citation checks will pass for chunk_id="leg_001".
+    """
     chunk = _make_chunk(source_type=source_type)
     retrieved = {chunk.chunk_id}
     lookup = {chunk.chunk_id: chunk}
@@ -105,6 +112,8 @@ def _make_facts() -> FactSection:
 
 
 # ── Read isolation ─────────────────────────────────────────────────────────
+# These tests verify the deepcopy contract: mutating an object returned by a
+# proxy read must NOT affect the underlying SessionMemory.
 
 class TestReadIsolation:
     def test_analysis_proxy_facts_is_deepcopy(self):
@@ -148,6 +157,9 @@ class TestReadIsolation:
 
 
 # ── Unexposed attribute access ─────────────────────────────────────────────
+# These tests verify that each proxy raises AttributeError for attributes it
+# does not own.  This is the primary enforcement mechanism for the
+# intelligence-layer's write-isolation contract.
 
 class TestAttributeAccess:
     def test_analysis_view_blocks_final_report(self):
@@ -240,7 +252,12 @@ class TestCitationIntegrity:
 
     def test_empty_chunk_ids_always_passes_citation_check(self):
         """A claim with no citations is allowed through citation check
-        (weakness detection catches it separately)."""
+        (weakness detection catches it separately).
+
+        Rationale: the citation check only validates that *listed* chunk_ids
+        are in the retrieved set.  An empty list has nothing to check, so it
+        passes — the UNSUPPORTED weakness reason handles the policy concern.
+        """
         memory, retrieved, lookup = _setup_memory_with_chunk()
         claim = _make_claim(chunk_ids=[])
         section = _make_definition_section(claims=[claim])
@@ -310,6 +327,11 @@ class TestLabelConsistency:
 
 # ── Confidence bounds ──────────────────────────────────────────────────────
 
+# ── Confidence bounds ──────────────────────────────────────────────────────
+# "confidence_bounds" is the check_name for both Confidence enum validation
+# AND Label enum validation.  Both are grouped under one check_name to
+# simplify orchestrator error-handling (one branch catches both).
+
 class TestConfidenceBounds:
     def test_invalid_confidence_string_on_section_raises(self):
         """Passing a raw string as confidence must fail."""
@@ -375,6 +397,11 @@ class TestMemoryWriteErrorMessage:
 
 
 # ── Checkpoint save and restore ────────────────────────────────────────────
+
+# ── Checkpoint save and restore ────────────────────────────────────────────
+# These tests exercise checkpoint behaviour directly without the orchestrator.
+# They simulate the orchestrator's _save_checkpoint / _restore_checkpoint
+# pattern: deepcopy → clear nested checkpoints → store → restore individual fields.
 
 class TestCheckpoints:
     """Tests for the orchestrator's checkpoint mechanism via direct memory manipulation."""

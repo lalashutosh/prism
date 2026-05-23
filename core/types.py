@@ -76,7 +76,7 @@ class Chunk:
     text:        str
     source_type: str             # see docstring above
     article_id:  Optional[str]   # e.g. "Article 3", "Annex I para 2"
-    metadata:    dict = field(default_factory=dict)
+    metadata:    dict = field(default_factory=dict)  # arbitrary key-value pairs from the retrieval layer (e.g. page_number, section_heading)
 
 
 # ── Atomic evidence unit ─────────────────────────────────────────────────────
@@ -94,8 +94,8 @@ class Claim:
     label:       Label
     confidence:  Confidence
     chunk_ids:   list[str]       # citations into the retrieved corpus
-    is_weak:     bool = False
-    weak_reason: Optional[str] = None
+    is_weak:     bool = False    # set by the validation agent when any weak criterion matches
+    weak_reason: Optional[str] = None  # one of "LOW_CONFIDENCE", "ASSUMPTION", "UNSUPPORTED"
 
 
 # ── Dimension findings (base + six subtypes) ─────────────────────────────────
@@ -290,9 +290,9 @@ class OrchestratorState:
     retrieval_cache:    dict[str, list[Chunk]] = field(default_factory=dict)
     # checkpoints stores named deep copies of SessionMemory (without _orchestrator)
     checkpoints:        dict[str, Any]         = field(default_factory=dict)
-    retry_counts:       dict[str, int]         = field(default_factory=dict)
-    loop_count:         int                    = 0
-    retrieved_chunk_ids: set[str]              = field(default_factory=set)
+    retry_counts:       dict[str, int]         = field(default_factory=dict)  # keys: "analysis_{dim_id}" | "validation_{claim_id}"
+    loop_count:         int                    = 0  # incremented once per analysis+validation+synthesis cycle; capped at MAX_LOOP_COUNT
+    retrieved_chunk_ids: set[str]              = field(default_factory=set)  # union of all chunk_ids ever returned by retrieve_fn this session
 
 
 # ── Signals ──────────────────────────────────────────────────────────────────

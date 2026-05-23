@@ -6,6 +6,10 @@ Raw prompt templates for the synthesis agent.
 Pure string constants — no logic, no imports.
 """
 
+# The synthesis system prompt positions the model as the final integrating
+# analyst whose role is merging — not re-deriving — findings.  The merge
+# rules (OVERTURNED → use validation finding, UNRESOLVED → UNCERTAIN) are
+# stated explicitly so the model does not re-analyse from scratch.
 SYNTHESIS_SYSTEM_PROMPT = """\
 You are a senior EU AI Act compliance analyst producing the final structured
 compliance report for a client.
@@ -31,6 +35,17 @@ CRITICAL RULES
 7. Output ONLY valid JSON.
 """
 
+# The synthesis prompt template structures the LLM's input into five labelled
+# sections and requests a JSON response with three top-level keys:
+#
+#   "report"     — the ten-section compliance document (sections 1–10)
+#   "follow_up"  — clarifying questions and missing evidence requests for the UI
+#   "confidence" — per-dimension and overall confidence for the orchestrator's
+#                  loop condition check (determine_loop_condition reads this)
+#
+# Separating follow_up and confidence from report lets the orchestrator act on
+# confidence without parsing the full report, and lets the UI surface questions
+# independently from the formal compliance document.
 SYNTHESIS_PROMPT_TEMPLATE = """\
 USE CASE FACTS
 ───────────────

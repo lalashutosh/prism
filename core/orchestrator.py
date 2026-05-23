@@ -30,6 +30,7 @@ import copy
 import hashlib
 import json
 import logging
+import time
 from typing import Any, Callable, Optional
 
 from core.types import (
@@ -51,6 +52,8 @@ from core.memory import (
 from agents.analysis_agent   import run_analysis_agent
 from agents.validation_agent import run_validation_agent
 from agents.synthesis_agent  import run_synthesis_agent
+from core.log_schema import PipelineEvent, SignalEntry
+from core.logger import PrismLogger
 
 logger = logging.getLogger(__name__)
 
@@ -80,14 +83,67 @@ class Orchestrator:
         retrieve_fn: Callable[[str, dict], list[Chunk]],
         extraction_fn: Optional[Callable] = None,
         llm_client: Any = None,
+        prism_logger: Optional[PrismLogger] = None,
     ) -> None:
         self._retrieve_fn    = retrieve_fn
         self._extraction_fn  = extraction_fn
         self._llm_client     = llm_client
+        # Optional structured logging.  None → all _log_* calls are no-ops so
+        # existing tests that create Orchestrator without a logger continue to work.
+        self._prism_logger   = prism_logger
 
         self._memory: SessionMemory = SessionMemory()
         # Convenience alias — orchestrator accesses _orchestrator directly.
         self._state: OrchestratorState = self._memory._orchestrator
+
+    # ── Logging helpers ──────────────────────────────────────────────────────
+    # Both helpers are no-ops when no PrismLogger was provided, so the entire
+    # logging layer is completely opt-in from the orchestrator's perspective.
+
+    def _log_pipeline(
+        self,
+        event_type: str,
+        agent: Optional[str] = None,
+        duration_ms: Optional[int] = None,
+        metadata: Optional[dict] = None,
+    ) -> None:
+        """Emit one PipelineEvent to the active PrismLogger."""
+        if self._prism_logger is None:
+            return
+        self._prism_logger.pipeline(PipelineEvent(
+            session_id=self._prism_logger.session_id,
+            event_type=event_type,
+            agent=agent,
+            duration_ms=duration_ms,
+            metadata=metadata or {},
+        ))
+
+    def _log_signal(
+        self,
+        signal_type: str,
+        agent: str,
+        payload: dict,
+        resolution: str,
+        dimension: Optional[str] = None,
+        retry_count: int = 0,
+    ) -> Optional[int]:
+        """Emit one SignalEntry to the active PrismLogger.
+
+        Returns the database row ID so the caller can later call
+        resolve_signal(id) to close the signal's lifecycle, or None when
+        no logger is active.
+        """
+        if self._prism_logger is None:
+            return None
+        return self._prism_logger.signal(SignalEntry(
+            session_id=self._prism_logger.session_id,
+            signal_type=signal_type,
+            agent=agent,
+            payload=payload,
+            resolution=resolution,
+            dimension=dimension,
+            retry_count=retry_count,
+        ))
 
     # ── Public entry point ──────────────────────────────────────────────────
 
@@ -108,6 +164,12 @@ class Orchestrator:
             directly.  Useful for testing and for external callers that
             already hold a FactSection.
         """
+        session_start = time.time()
+        self._log_pipeline("SESSION_STARTED", metadata={
+            "document_text_length": len(document_text) if document_text else 0,
+            "facts_injected": facts is not None,
+        })
+
         # ── Step 1: extraction ──────────────────────────────────────────────
         if facts is not None:
             # Inject pre-extracted facts directly (bypass extraction proxy).
@@ -131,7 +193,10 @@ class Orchestrator:
         logger.info("Initial broad retrieval complete.")
 
         # ── Steps 3–5: analysis / validation / synthesis (with loop) ────────
+        # loop_context carries the synthesis agent's refined guidance back into
+        # the analysis agent on a second pass.  Empty on the first pass.
         loop_context: str = ""
+        # range(MAX_LOOP_COUNT + 1) allows exactly one retry before giving up.
         for loop_iteration in range(MAX_LOOP_COUNT + 1):
             self._state.loop_count = loop_iteration
 
@@ -167,10 +232,18 @@ class Orchestrator:
                 loop_signal.reason,
             )
             loop_context = loop_signal.refined_context
+            self._log_pipeline(
+                "ROLLBACK_TRIGGERED",
+                metadata={"reason": loop_signal.reason, "target_checkpoint": "after_analysis"},
+            )
             self._restore_checkpoint("after_analysis")
             # Clear analysis + validation sections so the agents can re-write.
             self._reset_analysis_and_validation()
 
+        self._log_pipeline(
+            "SESSION_COMPLETED",
+            duration_ms=int((time.time() - session_start) * 1000),
+        )
         return self._memory.final_report
 
     # ── Extraction phase ─────────────────────────────────────────────────────
@@ -199,11 +272,16 @@ class Orchestrator:
           - MemoryWriteError → log and rollback if a critical section failed
           - retry_counts per dimension (max MAX_RETRIEVAL_RETRIES)
         """
+        phase_start = time.time()
+        self._log_pipeline("AGENT_STARTED", agent="analysis")
+
         context: dict = {
             "max_retrievals_reached": set(),
             "refined_context": refined_context,
         }
-        # Clear per-dimension retry counts from any previous loop.
+        # Clear per-dimension retry counts from any previous loop so a
+        # dimension that ran out of retries in loop 0 gets fresh attempts
+        # in loop 1 (if the synthesis agent triggers a second pass).
         for key in list(self._state.retry_counts.keys()):
             if key.startswith("analysis_"):
                 del self._state.retry_counts[key]
@@ -219,6 +297,11 @@ class Orchestrator:
                 break
 
             if isinstance(signal, CompletionSignal):
+                self._log_pipeline(
+                    "AGENT_COMPLETED",
+                    agent="analysis",
+                    duration_ms=int((time.time() - phase_start) * 1000),
+                )
                 break
             if isinstance(signal, RetrievalSignal):
                 retry_key = f"analysis_{signal.dimension}"
@@ -231,20 +314,36 @@ class Orchestrator:
                     context["max_retrievals_reached"].add(signal.dimension)
                     # Continue loop — agent will proceed with INSUFFICIENT.
                 else:
+                    sig_id = self._log_signal(
+                        "RETRIEVAL_SIGNAL",
+                        agent="analysis",
+                        payload={"query": signal.query, "filters": signal.filters},
+                        resolution="retrieving",
+                        dimension=signal.dimension,
+                        retry_count=count,
+                    )
                     self._retrieve_and_cache(signal.query, signal.filters)
                     self._state.retry_counts[retry_key] = count + 1
+                    if sig_id and self._prism_logger:
+                        self._prism_logger.resolve_signal(sig_id)
 
     # ── Validation phase ─────────────────────────────────────────────────────
 
     def _run_validation_phase(self) -> None:
         """Drive the validation agent through its signal loop."""
+        phase_start = time.time()
+        self._log_pipeline("AGENT_STARTED", agent="validation")
+
+        # The context dict is the validation agent's stateful scratchpad.
+        # It is created here (not inside the agent) so it persists across
+        # every re-invocation triggered by a RetrievalSignal.
         context: dict = {
-            "processed_claim_ids":    set(),
-            "retry_counts":           {},
-            "max_retrievals_reached": set(),
-            "overturned_claims":      [],
-            "flags":                  [],
-            "unresolved_ids":         [],
+            "processed_claim_ids":    set(),   # claim IDs already assessed; skip on re-entry
+            "retry_counts":           {},       # per-claim retrieval retry counts
+            "max_retrievals_reached": set(),    # claim IDs where retry limit was hit
+            "overturned_claims":      [],       # accumulated OverturnedClaim objects
+            "flags":                  [],       # accumulated ValidationFlag objects
+            "unresolved_ids":         [],       # claim IDs with UNRESOLVED verdict
         }
 
         while True:
@@ -258,6 +357,11 @@ class Orchestrator:
                 break
 
             if isinstance(signal, CompletionSignal):
+                self._log_pipeline(
+                    "AGENT_COMPLETED",
+                    agent="validation",
+                    duration_ms=int((time.time() - phase_start) * 1000),
+                )
                 break
             if isinstance(signal, RetrievalSignal):
                 claim_id = signal.dimension  # per spec, claim_id used as dimension
@@ -271,9 +375,19 @@ class Orchestrator:
                     # Update per-claim retry in context too.
                     context["retry_counts"][claim_id] = MAX_RETRIEVAL_RETRIES
                 else:
+                    sig_id = self._log_signal(
+                        "RETRIEVAL_SIGNAL",
+                        agent="validation",
+                        payload={"query": signal.query, "filters": signal.filters},
+                        resolution="retrieving",
+                        dimension=claim_id,
+                        retry_count=count,
+                    )
                     self._retrieve_and_cache(signal.query, signal.filters)
                     self._state.retry_counts[retry_key] = count + 1
                     context["retry_counts"][claim_id] = count + 1
+                    if sig_id and self._prism_logger:
+                        self._prism_logger.resolve_signal(sig_id)
 
     # ── Synthesis phase ──────────────────────────────────────────────────────
 
@@ -283,6 +397,9 @@ class Orchestrator:
         Returns None (CompletionSignal received) or the LoopSignal so the
         caller can decide whether to roll back.
         """
+        phase_start = time.time()
+        self._log_pipeline("AGENT_STARTED", agent="synthesis")
+
         context: dict = {"loop_count": self._state.loop_count}
         view = self._make_synthesis_view()
         try:
@@ -300,9 +417,21 @@ class Orchestrator:
                     "Quality regression detected after synthesis; "
                     "proceeding anyway (loop limit)."
                 )
+            self._log_pipeline(
+                "AGENT_COMPLETED",
+                agent="synthesis",
+                duration_ms=int((time.time() - phase_start) * 1000),
+            )
             return None
 
         if isinstance(signal, LoopSignal):
+            self._log_pipeline("LOOP_TRIGGERED", metadata={"reason": signal.reason})
+            self._log_signal(
+                "LOOP_SIGNAL",
+                agent="synthesis",
+                payload={"reason": signal.reason, "refined_context": signal.refined_context},
+                resolution="rolling_back_to_after_analysis",
+            )
             return signal
 
         raise ValueError(f"Unexpected signal from synthesis agent: {type(signal)}")
@@ -335,6 +464,7 @@ class Orchestrator:
         snapshot._orchestrator.checkpoints = {}
         self._state.checkpoints[name] = snapshot
         logger.debug("Checkpoint '%s' saved.", name)
+        self._log_pipeline("CHECKPOINT_SAVED", metadata={"checkpoint": name})
 
     def _restore_checkpoint(self, name: str) -> None:
         """Restore SessionMemory data sections from a named checkpoint.
@@ -362,6 +492,7 @@ class Orchestrator:
         self._memory.follow_up_questions  = copy.deepcopy(snapshot.follow_up_questions)
         self._memory.confidence_summary   = copy.deepcopy(snapshot.confidence_summary)
         logger.debug("Checkpoint '%s' restored.", name)
+        self._log_pipeline("CHECKPOINT_RESTORED", metadata={"checkpoint": name})
 
     def _reset_analysis_and_validation(self) -> None:
         """Clear analysis + validation sections so agents can rewrite them."""
@@ -386,8 +517,10 @@ class Orchestrator:
         cache_key = _make_cache_key(query, filters)
         if cache_key in self._state.retrieval_cache:
             logger.debug("Cache hit for query: %s", query[:60])
+            self._log_pipeline("CACHE_HIT", metadata={"query": query[:200], "filters": filters})
             return self._state.retrieval_cache[cache_key]
 
+        self._log_pipeline("RETRIEVE_CALLED", metadata={"query": query[:200], "filters": filters})
         chunks = self._retrieve_fn(query, filters)
         self._state.retrieval_cache[cache_key] = chunks
         for chunk in chunks:
@@ -473,6 +606,12 @@ class Orchestrator:
             agent_name,
             error.check_name,
             error.detail,
+        )
+        self._log_signal(
+            "MEMORY_WRITE_ERROR",
+            agent=agent_name,
+            payload={"check_name": error.check_name, "detail": error.detail},
+            resolution=f"rolling_back_to_{fallback_checkpoint}",
         )
         try:
             self._restore_checkpoint(fallback_checkpoint)

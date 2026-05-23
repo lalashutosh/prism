@@ -47,6 +47,7 @@ from core.types import (
     ValidationSection,
     WeakClaim,
 )
+from core.logger import log_reasoning
 from core.memory import SynthesisAgentMemoryView
 from prompts.synthesis_prompts import (
     SYNTHESIS_SYSTEM_PROMPT,
@@ -138,6 +139,10 @@ def merge_analysis_with_validation(
                 })
 
         # Carry dimension-specific scalar fields.
+        # getattr with a None default safely handles dimensions that don't
+        # have a particular attribute (e.g. is_ai_system is only on DefinitionSection).
+        # hasattr(val, "value") handles enum fields (RiskLevel, etc.) by serialising
+        # them to their string value so the merged dict is plain JSON-serialisable.
         extra: dict = {}
         for attr in (
             "is_ai_system", "risk_level",
@@ -304,6 +309,11 @@ def _extract_json(text: str) -> dict:
 
 
 def _serialise_validation_section(vf: Optional[ValidationSection]) -> str:
+    """Serialise the ValidationSection to a JSON string for prompt injection.
+
+    Each flag carries the per-claim verdict (CONFIRMED/OVERTURNED/UNRESOLVED)
+    that the synthesis agent uses to apply overrides and mark uncertain items.
+    """
     if vf is None:
         return "No validation data."
     return json.dumps(
@@ -325,6 +335,11 @@ def _serialise_validation_section(vf: Optional[ValidationSection]) -> str:
 
 
 def _serialise_weak_claims(weak_claims: list[WeakClaim]) -> str:
+    """Serialise weak claims for prompt injection.
+
+    Included in the synthesis prompt so the model can surface the original
+    weakness reasons in the final report's missing_information section.
+    """
     if not weak_claims:
         return "[]"
     return json.dumps(
@@ -342,6 +357,12 @@ def _serialise_weak_claims(weak_claims: list[WeakClaim]) -> str:
 
 
 def _serialise_chunks_by_source(chunks: list[Chunk]) -> str:
+    """Group available chunks by source_type for the prompt's citation section.
+
+    The synthesis agent uses this to populate citations_by_source in the final
+    report — grouping by source makes it easy for the model to reference the
+    correct chunk_ids under the correct source category.
+    """
     by_source: dict[str, list[dict]] = defaultdict(list)
     for chunk in chunks:
         by_source[chunk.source_type].append(
@@ -354,7 +375,10 @@ def _serialise_chunks_by_source(chunks: list[Chunk]) -> str:
 # ORCHESTRATION
 # ══════════════════════════════════════════════════════════════════════════════
 
+@log_reasoning(agent="synthesis")
 def _call_llm(prompt: str, system: str, client: Any) -> str:
+    # dimension=None (default) because synthesis integrates all six dimensions
+    # into one call rather than processing a single dimension.
     response = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=8192,
