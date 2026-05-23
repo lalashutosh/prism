@@ -1,4 +1,7 @@
-# Byte-compiled / optimized / DLL files# Byte-compiled / optimized / DLL files
+# ---------------------------------------------------
+# 1. Python Cache & Compilation Artifacts (Essential)
+# ---------------------------------------------------
+# This covers all the __pycache__ folders and .pyc files in your tree
 __pycache__/
 *.py[cod]
 *$py.class

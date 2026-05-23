@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PDF Chat</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div class="brand">PDF Query</div>
+        <div id="status" class="status">Ready.</div>
+      </header>
+      <section class="chat" aria-label="Chat">
+        <div id="messages" class="messages"></div>
+        <form id="chatForm" class="composer">
+          <textarea id="questionInput" rows="2" placeholder="Ask about the indexed PDFs"></textarea>
+          <button type="submit">Send</button>
+        </form>
+      </section>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>
